@@ -1,0 +1,205 @@
+---
+title: "Giant Pumpkins"
+author: "Botond Barabas"
+output: html_document
+---
+
+
+### Loading libraries and data
+
+```{r load_libs}
+library(tidyverse)
+library(tidymodels)
+```
+
+```{r load_data}
+pumpkins_raw <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2021/2021-10-19/pumpkins.csv")
+```
+
+### General data cleaning
+
+```{r cleaning, warning=FALSE}
+pumpkins <- pumpkins_raw %>%
+  separate(id, into = c("year", "type")) %>%
+  mutate(across(c(year, weight_lbs, ott, place, pct_chart), parse_number)) %>%
+  select(year, type, place, weight_lbs, state_prov, country, gpc_site, pct_chart, ott) %>%
+  filter(ott > 20, ott < 1e3) %>%
+  filter(!is.na(place), !is.na(pct_chart))
+```
+
+### Creating EDA charts to understand data better
+
+```{r eda_charts, warning=FALSE}
+pumpkins %>% 
+  count(type) %>% 
+  ggplot(aes(x = type, y = n, fill = type)) + 
+  geom_col() + 
+  scale_fill_viridis_d() + 
+  theme_minimal() +
+  theme(legend.position = "none")+
+  labs(x = "types", y = "number of pumpkins") 
+
+pumpkins %>% 
+  ggplot(aes(x = weight_lbs, fill = type)) + 
+  geom_density(alpha = 0.3) + 
+  scale_fill_viridis_d() + 
+  labs(x = "weight (lbs)", fill = "types", y = NULL) + 
+  theme_minimal()
+
+
+pumpkins %>% 
+  ggplot(aes(ott, weight_lbs, color = place)) + 
+  geom_point(alpha = 0.2, size = 1.1) + 
+  labs(x = "over-the-top measurement", y = "weight (lbs)", color = "placement") + 
+  scale_color_viridis_c() + 
+  facet_wrap(~type) + 
+  theme_minimal()
+
+pumpkins %>% 
+  ggplot(aes(ott, weight_lbs)) + 
+  geom_point(alpha = 0.2, size = 1.1, color = "grey60") + 
+  geom_smooth(aes(color = factor(year)), 
+              method = lm, formula = y ~ splines::bs(x, 3), 
+              se = FALSE, size = 1.5, alpha = 0.6
+              ) + 
+  labs(x = "over-the-top measurement", y = "weight (lbs)", color = NULL) + 
+  scale_color_viridis_d() + 
+  facet_wrap(~type) + 
+  theme_minimal()
+
+pumpkins %>% 
+  mutate(
+    country = fct_lump(country, n = 10), 
+    country = fct_reorder(country, weight_lbs) 
+  )%>%
+  ggplot(aes(country, weight_lbs, color = country)) + 
+  geom_boxplot(outlier.alpha = 0.01) + 
+  geom_jitter(alpha = 0.1, width = 0.15) + 
+  labs(x = NULL, y = "weight (lbs)") + 
+  scale_color_viridis_d() + 
+  theme_minimal() + 
+  theme(legend.position = "none", axis.text.x = element_text(angle = 90))
+```
+
+
+### Building workflow set
+
+```{r data_budget_management}
+set.seed(123)
+pumpkin_split <- pumpkins %>% 
+  initial_split(strata = weight_lbs)
+
+pumpkin_train <- training(pumpkin_split)
+pumpkin_test<- testing(pumpkin_split)
+
+set.seed(234)
+pumpkin_folds <- vfold_cv(pumpkin_train, strata = weight_lbs)
+#pumpkin_folds
+```
+
+
+At this point the variables contain the following: 
+pumpkin_split: stratified split of the data into training (pumpkin_train) and testing data (pumpkin_test) 
+
+pumpkin_folds: 10 fold split of the pumpkin_training data for cross validation 
+
+
+```{r recipe_creation}
+base_rec <- 
+  recipe(weight_lbs ~ ott + year + place + 
+           state_prov + country + gpc_site + 
+           pct_chart + type, data = pumpkin_train) %>% 
+  step_other(country, threshold = 0.02) %>% 
+  step_other(state_prov, threshold = 0.05) %>%
+  step_other(gpc_site, threshold = 0.02)
+
+ind_rec <- 
+  base_rec %>% 
+  step_dummy(all_nominal_predictors())
+
+spline_rec <- 
+  ind_rec %>% 
+  step_bs(ott)
+
+```
+
+
+Three recipes were made that build on top of each other: 
+1) base: shrinking the long tail of country , gpc_site and state_prov into two "Other" fields 
+2) ind: creating all dummy states for all non numerical variables 
+3) spline: created all basis expansions using B-splines of the ott variable
+
+
+```{r fitting_engines_specified}
+
+rf_spec <- rand_forest(trees = 1e3) %>%
+  set_mode("regression") %>% 
+  set_engine("ranger") 
+
+mars_spec <- mars() %>%
+  set_mode("regression") %>%
+  set_engine("earth")
+
+lm_spec <- linear_reg()
+
+```
+
+Created three model specifications: 
+1) random forest with 1000 trees 
+2) MARS (Multivariate Adaptive Regression Splines)
+3) basic linear regression 
+
+
+```{r workflow_set_building}
+pumpkin_set <- workflow_set(
+  list(base_rec, ind_rec, spline_rec), 
+  list(rf_spec, mars_spec, lm_spec), 
+  cross = TRUE
+)
+
+pumpkin_set
+```
+
+This workflow set will iterate on all recipes and all fitting engines we have set. (cross = TRUE will tell tidymodels to actually create all combinations )
+
+
+
+### Fitting models 
+
+```{r workflow_mapping}
+doParallel::registerDoParallel()
+set.seed(345)
+
+pumpkin_rs <- 
+  workflow_map(
+    pumpkin_set, 
+    "fit_resamples", 
+    resamples = pumpkin_folds
+  )
+
+pumpkin_rs
+
+```
+
+```{r wf_evaluations}
+autoplot(pumpkin_rs)
+collect_metrics(pumpkin_rs)
+```
+
+The recipe_1_rand_forest	is the best looking from the workflows. Let's extract it. 
+
+```{r fitting}
+final_fit <- 
+  extract_workflow(pumpkin_rs, "recipe_1_rand_forest") %>%
+  fit(pumpkin_train)
+
+```
+
+```{r model_analysis}
+final_fit
+```
+
+```{r}
+#ranger::importance_pvalues(extract_fit_engine(final_fit))
+```
+
